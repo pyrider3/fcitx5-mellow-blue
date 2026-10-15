@@ -1,0 +1,360 @@
+diff --git a/src/ui/classic/CMakeLists.txt b/src/ui/classic/CMakeLists.txt
+index e377f43..b2b8e49 100644
+--- a/src/ui/classic/CMakeLists.txt
++++ b/src/ui/classic/CMakeLists.txt
+@@ -23,7 +23,7 @@ if (ENABLE_X11)
+     set(CLASSICUI_SRCS ${CLASSICUI_SRCS}
+         xcbui.cpp xcbwindow.cpp xcbtraywindow.cpp xcbinputwindow.cpp xcbmenu.cpp)
+     set(CLASSICUI_LIBS ${CLASSICUI_LIBS} PkgConfig::CairoXCB Fcitx5::Module::XCB
+-        XCB::AUX XCB::ICCCM XCB::XINERAMA XCB::RANDR XCB::EWMH)
++        XCB::SHAPE XCB::AUX XCB::ICCCM XCB::XINERAMA XCB::RANDR XCB::EWMH)
+ endif()
+ 
+ if (ENABLE_DBUS)
+diff --git a/src/ui/classic/classicui.cpp b/src/ui/classic/classicui.cpp
+index a0a2a7f..706f881 100644
+--- a/src/ui/classic/classicui.cpp
++++ b/src/ui/classic/classicui.cpp
+@@ -142,7 +142,7 @@ ClassicUI::ClassicUI(Instance *instance) : instance_(instance) {
+         EventType::UIChanged, EventWatcherPhase::Default, [this](Event &) {
+             if (instance_->currentUI() == "kimpanel") {
+                 deferedReloadTheme_->setOneShot();
+-            } else if (instance_->currentUI() == "classicui") {
++            } else if (instance_->currentUI() == "smoothui") {
+                 deferedReloadTheme_->setOneShot();
+             }
+         }));
+@@ -539,4 +539,4 @@ bool ClassicUI::showLayoutNameInIcon() const {
+ 
+ } // namespace fcitx::classicui
+ 
+-FCITX_ADDON_FACTORY_V2(classicui, fcitx::classicui::ClassicUIFactory);
++FCITX_ADDON_FACTORY_V2(smoothui, fcitx::classicui::ClassicUIFactory);
+diff --git a/src/ui/classic/inputwindow.cpp b/src/ui/classic/inputwindow.cpp
+index 3f05155..c1d3eaa 100644
+--- a/src/ui/classic/inputwindow.cpp
++++ b/src/ui/classic/inputwindow.cpp
+@@ -340,11 +340,15 @@ void InputWindow::setTextToLayout(
+ }
+ 
+ std::pair<int, int> InputWindow::update(InputContext *inputContext) {
++    bool wasVisible=visible_;
++    auto *previousContext=inputContext_.get();
+     hoverIndex_ = -1;
+     if ((parent_->suspended() &&
+          parent_->instance()->currentUI() != "kimpanel") ||
+         !inputContext) {
+         visible_ = false;
++        motion_.reset(); snapMotion_=true;
++        startClosing();
+         return {0, 0};
+     }
+     // | aux up | preedit
+@@ -467,9 +471,63 @@ std::pair<int, int> InputWindow::update(InputContext *inputContext) {
+             visible_ = false;
+         }
+     }
++    // Candidate contents and composition identify a generation. Do not animate
++    // typing, paging, focus changes, first appearance or hidden panels.
++    std::string content=preedit.toString()+"\x1e"+auxUp.toString()+"\x1e"+auxDown.toString();
++    auto append=[&content](const MultilineLayout &layout) {
++        for(const auto &line:layout.lines_) {content+='\x1f';content+=pango_layout_get_text(line.get());}
++    };
++    for(size_t i=0;i<nCandidates_;++i) {
++        append(candidateLayouts_[i].label);append(candidateLayouts_[i].text);append(candidateLayouts_[i].comment);
++    }
++    if(!wasVisible || previousContext!=inputContext || content!=motionContent_ || !visible_) {
++        motion_.reset();snapMotion_=true;
++        if(motionTimer_) motionTimer_->setEnabled(false);
++    }
++    motionContent_=std::move(content);
++    if(visible_) {
++        popupFade_.open(now(CLOCK_MONOTONIC));
++        if(popupFade_.step(now(CLOCK_MONOTONIC))) scheduleMotion();
++    } else startClosing();
+     return {width, height};
+ }
+ 
++void InputWindow::startClosing() {
++    if(popupSnapshot_ && popupFade_.phase!=smoothui::PopupFade::Phase::Hidden) {
++        popupFade_.close(now(CLOCK_MONOTONIC));scheduleMotion();
++    } else {
++        popupFade_.reset();
++        if(motionTimer_) motionTimer_->setEnabled(false);
++    }
++}
++
++void InputWindow::scheduleMotion() {
++    if(!repaintMotion_ || !renderable()) return;
++    if(!motionTimer_) {
++        motionTimer_=parent_->instance()->eventLoop().addTimeEvent(
++            CLOCK_MONOTONIC,now(CLOCK_MONOTONIC)+16666,1000,
++            [this](EventSourceTime *timer,uint64_t) {
++                bool closing=popupFade_.closing();
++                uint64_t time=now(CLOCK_MONOTONIC);
++                bool fading=popupFade_.step(time);
++                if(closing && !fading) {
++                    popupSnapshot_.reset();
++                    if(!visible_ && finishClose_) finishClose_();
++                    timer->setEnabled(false);return true;
++                }
++                if(!renderable() || !repaintMotion_) {timer->setEnabled(false);return true;}
++                repaintMotion_();
++                if(motion_.active(time) || fading) {
++                    timer->setNextInterval(16666);timer->setOneShot();
++                } else timer->setEnabled(false);
++                return true;
++            });
++        motionTimer_->setOneShot();
++    } else if(!motionTimer_->isEnabled()) {
++        motionTimer_->setNextInterval(16666);motionTimer_->setOneShot();
++    }
++}
++
+ std::pair<unsigned int, unsigned int> InputWindow::sizeHint() {
+     auto &theme = parent_->theme();
+     auto *fontDesc =
+@@ -519,6 +577,14 @@ void InputWindow::paint(cairo_t *cr, double width, double height) {
+     cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+     cairo_paint(cr);
+     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
++    if(popupFade_.closing()) {
++        if(popupSnapshot_) {
++            cairo_save(cr);cairo_translate(cr,0,popupFade_.offset(now(CLOCK_MONOTONIC)));cairo_set_source(cr,popupSnapshot_.get());
++            cairo_paint_with_alpha(cr,popupFade_.opacity(now(CLOCK_MONOTONIC)));cairo_restore(cr);
++        }
++        return;
++    }
++    cairo_push_group(cr);
+     theme.paint(cr, *theme.inputPanel->background, 0, 0, width, height,
+                 /*alpha=*/1.0);
+     const auto &margin = *theme.inputPanel->contentMargin;
+@@ -569,6 +635,34 @@ void InputWindow::paint(cairo_t *cr, double width, double height) {
+     candidateRegions_.clear();
+     candidateRegions_.reserve(nCandidates_);
+ 
++    // Paint the moving highlight before ALL text. This avoids covering an
++    // earlier candidate while the highlight moves towards a later candidate.
++    int activeIndex=highlight();
++    if(activeIndex>=0 && size_t(activeIndex)<nCandidates_) {
++        auto &node=candidateNodes_[activeIndex];
++        const auto &hm=*theme.inputPanel->highlight->margin;
++        double cw=YGNodeLayoutGetWidth(node.inner.get());
++        bool vertical=parent_->config().verticalCandidateList.value();
++        if(layoutHint_==CandidateLayoutHint::Vertical) vertical=true;
++        else if(layoutHint_==CandidateLayoutHint::Horizontal) vertical=false;
++        if(*theme.inputPanel->fullWidthHighlight && vertical)
++            cw=width-*margin.marginLeft-*margin.marginRight-*textMargin.marginRight-*textMargin.marginLeft;
++        smoothui::Box target{
++            absolute<YGNodeLayoutGetLeft>(node.inner)-*hm.marginLeft,
++            absolute<YGNodeLayoutGetTop>(node.inner)-*hm.marginTop,
++            cw+*hm.marginLeft+*hm.marginRight,
++            YGNodeLayoutGetHeight(node.inner.get())+*hm.marginTop+*hm.marginBottom};
++        uint64_t time=now(CLOCK_MONOTONIC);
++        motion_.set(target,time,snapMotion_);snapMotion_=false;
++        auto box=motion_.sample(time);
++        cairo_save(cr);
++        theme.paint(cr,*theme.inputPanel->highlight,box.x,box.y,box.w,box.h,1.0);
++        cairo_restore(cr);
++        if(motion_.active(time)) scheduleMotion();
++    } else {
++        motion_.reset();snapMotion_=true;
++    }
++
+     // Use yoga-based positioning for candidates
+     for (size_t i = 0; i < nCandidates_; i++) {
+         float labelLeft =
+@@ -611,16 +705,6 @@ void InputWindow::paint(cairo_t *cr, double width, double height) {
+         const int highlightIndex = highlight();
+         bool highlight = false;
+         if (highlightIndex >= 0 && i == static_cast<size_t>(highlightIndex)) {
+-            cairo_save(cr);
+-            theme.paint(cr, *theme.inputPanel->highlight,
+-                        candidateLeft - *highlightMargin.marginLeft,
+-                        candidateTop - *highlightMargin.marginTop,
+-                        highlightWidth + *highlightMargin.marginLeft +
+-                            *highlightMargin.marginRight,
+-                        candidateHeight + *highlightMargin.marginTop +
+-                            *highlightMargin.marginBottom,
+-                        /*alpha=*/1.0);
+-            cairo_restore(cr);
+             highlight = true;
+         }
+ 
+@@ -736,6 +820,15 @@ void InputWindow::paint(cairo_t *cr, double width, double height) {
+     if (classicui_logcategory().checkLogLevel(Debug)) {
+         renderYogaNode(cr, rootNode_.get());
+     }
++    // Cache the un-faded visual only; fade-out does not require an active IC.
++    auto *content=cairo_pop_group(cr);
++    popupSnapshot_.reset(cairo_pattern_reference(content));
++    cairo_save(cr);
++    double opacity=popupFade_.opacity(now(CLOCK_MONOTONIC));
++    double offset=popupFade_.offset(now(CLOCK_MONOTONIC));
++    cairo_translate(cr,0,offset);cairo_set_source(cr,content);
++    cairo_paint_with_alpha(cr,opacity);cairo_restore(cr);cairo_pattern_destroy(content);
++
+ }
+ 
+ void InputWindow::click(int x, int y) {
+diff --git a/src/ui/classic/inputwindow.h b/src/ui/classic/inputwindow.h
+index 8b5610d..6961fdc 100644
+--- a/src/ui/classic/inputwindow.h
++++ b/src/ui/classic/inputwindow.h
+@@ -32,6 +32,8 @@
+ #include "fcitx/inputcontext.h"
+ #include "fcitx/text.h"
+ #include "common.h"
++#include "motion.h"
++#include "fcitx-utils/event.h"
+ 
+ namespace fcitx::classicui {
+ 
+@@ -106,6 +108,11 @@ public:
+     bool hover(int x, int y);
+     void click(int x, int y);
+     void wheel(bool up);
++    std::function<void()> repaintMotion_;
++    void scheduleMotion();
++    bool fadingOut() const { return popupFade_.closing(); }
++    bool renderable() const { return visible_ || fadingOut(); }
++    std::function<void()> finishClose_;
+ 
+ protected:
+     enum class TextType { Label, Regular, Comment };
+@@ -160,6 +167,13 @@ protected:
+     int hoverIndex_ = -1;
+ 
+ private:
++    smoothui::Motion motion_;
++    smoothui::PopupFade popupFade_;
++    UniqueCPtr<cairo_pattern_t,cairo_pattern_destroy> popupSnapshot_;
++    void startClosing();
++    bool snapMotion_=true;
++    std::string motionContent_;
++    std::unique_ptr<EventSourceTime> motionTimer_;
+     std::pair<unsigned int, unsigned int> sizeHint();
+ 
+     using YGNodePtr = fcitx::UniqueCPtr<YGNode, YGNodeFree>;
+diff --git a/src/ui/classic/waylandinputwindow.cpp b/src/ui/classic/waylandinputwindow.cpp
+index a832979..273f39e 100644
+--- a/src/ui/classic/waylandinputwindow.cpp
++++ b/src/ui/classic/waylandinputwindow.cpp
+@@ -38,6 +38,11 @@ namespace fcitx::classicui {
+ 
+ WaylandInputWindow::WaylandInputWindow(WaylandUI *ui)
+     : InputWindow(ui->parent()), ui_(ui), window_(ui->newWindow()) {
++    repaintMotion_=[this]() { repaint(); };
++    finishClose_=[this]() {
++        hoverIndex_=-1;window_->hide();repaintIC_.unwatch();
++        panelSurface_.reset();panelSurfaceV2_.reset();blur_.reset();window_->destroyWindow();
++    };
+     window_->createWindow();
+     window_->repaint().connect([this]() {
+         if (auto *ic = repaintIC_.get()) {
+@@ -144,18 +149,27 @@ void WaylandInputWindow::updateScale() { window_->updateScale(); }
+ void WaylandInputWindow::resetPanel() { panelSurface_.reset(); }
+ 
+ void WaylandInputWindow::update(fcitx::InputContext *ic) {
+-    const auto oldVisible = visible();
++    bool wasClosing=fadingOut();
++    const auto oldVisible = renderable();
+     auto [width, height] = InputWindow::update(ic);
+     CLASSICUI_DEBUG() << "Wayland Input Window visible:" << visible()
+                       << " for IC program:"
+                       << (ic ? ic->program() : std::string("-")) << " frontend:"
+                       << (ic ? ic->frontendName() : std::string("-"));
+-    if (!oldVisible && !visible()) {
++    if (!oldVisible && !renderable()) {
+         CLASSICUI_DEBUG() << "Wayland Input Window has been hidden.";
+         return;
+     }
+ 
+     if (!visible()) {
++        if(fadingOut()) {
++            auto compositor=ui_->display()->getGlobal<wayland::WlCompositor>();
++            if(compositor && window_->surface()) {
++                std::unique_ptr<wayland::WlRegion> empty(compositor->createRegion());
++                window_->surface()->setInputRegion(empty.get());
++            }
++            repaint();return;
++        }
+         CLASSICUI_DEBUG() << "Hide Wayland Input Window.";
+         hoverIndex_ = -1;
+         window_->hide();
+@@ -172,6 +186,7 @@ void WaylandInputWindow::update(fcitx::InputContext *ic) {
+     CLASSICUI_DEBUG()
+         << "Wayland Input Window is visible, ensure surface is created.";
+     initPanel();
++    if((wasClosing || !oldVisible) && window_->surface()) window_->surface()->setInputRegion(nullptr);
+     if (ic->frontendName() == "wayland_v2") {
+         if (!panelSurfaceV2_ || ic != v2IC_.get()) {
+             auto *waylandim = ui_->parent()->waylandim();
+@@ -219,7 +234,7 @@ void WaylandInputWindow::update(fcitx::InputContext *ic) {
+ }
+ 
+ void WaylandInputWindow::repaint() {
+-    if (!visible()) {
++    if (!renderable()) {
+         return;
+     }
+ 
+diff --git a/src/ui/classic/xcbinputwindow.cpp b/src/ui/classic/xcbinputwindow.cpp
+index fd035db..b10df47 100644
+--- a/src/ui/classic/xcbinputwindow.cpp
++++ b/src/ui/classic/xcbinputwindow.cpp
+@@ -1,3 +1,4 @@
++#include <xcb/shape.h>
+ /*
+  * SPDX-FileCopyrightText: 2017-2017 CSSlayer <wengxt@gmail.com>
+  *
+@@ -43,6 +44,8 @@ void XCBInputWindow::postCreateWindow() {
+         xcb_ewmh_set_wm_pid(ui_->ewmh(), wid_, getpid());
+     }
+ 
++    repaintMotion_=[this]() { repaint(); };
++    finishClose_=[this]() {xcb_unmap_window(ui_->connection(),wid_);hoverIndex_=-1;xcb_flush(ui_->connection());};
+     const char name[] = "Fcitx5 Input Window";
+     xcb_icccm_set_wm_name(ui_->connection(), wid_, XCB_ATOM_STRING, 8,
+                           sizeof(name) - 1, name);
+@@ -177,12 +180,19 @@ void XCBInputWindow::update(InputContext *inputContext) {
+     if (!wid_) {
+         return;
+     }
+-    auto oldVisible = visible();
++    bool wasClosing=fadingOut();
++    auto oldVisible = renderable();
+     if (inputContext) {
+         updateDPI(inputContext);
+     }
+     auto [width, height] = InputWindow::update(inputContext);
+     if (!visible()) {
++        if(fadingOut()) {
++            // A fading snapshot must not intercept clicks on the application.
++            const auto *shape=xcb_get_extension_data(ui_->connection(),&xcb_shape_id);
++            if(shape && shape->present) xcb_shape_rectangles(ui_->connection(),XCB_SHAPE_SO_SET,XCB_SHAPE_SK_INPUT,XCB_CLIP_ORDERING_UNSORTED,wid_,0,0,0,nullptr);
++            repaint();return;
++        }
+         if (oldVisible) {
+             xcb_unmap_window(ui_->connection(), wid_);
+             hoverIndex_ = -1;
+@@ -190,6 +200,10 @@ void XCBInputWindow::update(InputContext *inputContext) {
+         return;
+     }
+ 
++    if(!oldVisible || wasClosing) {
++        const auto *shape=xcb_get_extension_data(ui_->connection(),&xcb_shape_id);
++        if(shape && shape->present) xcb_shape_mask(ui_->connection(),XCB_SHAPE_SO_SET,XCB_SHAPE_SK_INPUT,wid_,0,0,XCB_NONE);
++    }
+     auto oldPhysicalWidth = physicalWidth_;
+     auto oldPhysicalHeight = physicalHeight_;
+     resize(width, height);
+@@ -293,7 +307,7 @@ bool XCBInputWindow::filterEvent(xcb_generic_event_t *event) {
+ }
+ 
+ void XCBInputWindow::repaint() {
+-    if (!visible()) {
++    if (!renderable()) {
+         return;
+     }
+     if (auto *surface = prerender()) {
